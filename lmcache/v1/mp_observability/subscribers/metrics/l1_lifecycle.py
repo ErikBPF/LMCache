@@ -23,6 +23,26 @@ from opentelemetry import metrics
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
 
+# Explicit bucket boundaries (seconds) for the lifecycle histograms.  The
+# OTel SDK default grid (0, 5, ..., 250, 500, 750, ..., 10000) is tuned for
+# millisecond latencies and has no resolution in the 1 s - 4 h range where
+# L1 chunk lifetimes actually fall.
+_LIFECYCLE_BUCKETS_S: tuple[float, ...] = (
+    1.0,
+    5.0,
+    15.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    900.0,
+    1800.0,
+    3600.0,
+    7200.0,
+    14400.0,
+)
+
 
 @dataclass
 class _L1ChunkState:
@@ -45,7 +65,10 @@ class L1LifecycleSubscriber(EventSubscriber):
     Parameters:
         sample_rate: Fraction of chunks to track (0, 1.0].  Default 0.01 (1%).
         max_evict_reuse_wait: Maximum seconds to track an evicted chunk
-            waiting for reuse.  Default 300 s (5 min).
+            waiting for reuse.  Must be positive.  Default 300 s (5 min).
+
+    Raises:
+        ValueError: If ``max_evict_reuse_wait`` is not positive.
     """
 
     def __init__(
@@ -56,6 +79,10 @@ class L1LifecycleSubscriber(EventSubscriber):
         assert 0 < sample_rate <= 1.0, (
             f"sample_rate must be in (0, 1.0], got {sample_rate}"
         )
+        if max_evict_reuse_wait <= 0:
+            raise ValueError(
+                f"max_evict_reuse_wait must be positive, got {max_evict_reuse_wait}"
+            )
         self._sample_rate = sample_rate
         self._max_evict_reuse_wait = max_evict_reuse_wait
         # Deterministic sampling via hash: hash(key) % _SAMPLE_PRIME < threshold.
@@ -69,11 +96,13 @@ class L1LifecycleSubscriber(EventSubscriber):
                 "Histogram of L1 chunk lifetime from allocation to eviction (seconds)."
             ),
             unit="s",
+            explicit_bucket_boundaries_advisory=_LIFECYCLE_BUCKETS_S,
         )
         self._idle_hist = meter.create_histogram(
             "lmcache_mp.l1_chunk_idle_before_evict",
             description=("Histogram of idle time before L1 chunk eviction (seconds)."),
             unit="s",
+            explicit_bucket_boundaries_advisory=_LIFECYCLE_BUCKETS_S,
         )
         self._reuse_gap_hist = meter.create_histogram(
             "lmcache_mp.l1_chunk_reuse_gap",
@@ -82,7 +111,16 @@ class L1LifecycleSubscriber(EventSubscriber):
                 "touches (write or read) of the same L1 chunk (seconds)."
             ),
             unit="s",
+            explicit_bucket_boundaries_advisory=_LIFECYCLE_BUCKETS_S,
         )
+        # Values are capped at max_evict_reuse_wait, so drop boundaries above
+        # the cap and make the cap itself the final boundary.  Otherwise every
+        # capped sample lands in a wider bucket (SDK default: (250, 500]) and
+        # histogram_quantile interpolates values above the cap that were
+        # never observed.
+        evict_reuse_buckets = [
+            b for b in _LIFECYCLE_BUCKETS_S if b < max_evict_reuse_wait
+        ] + [max_evict_reuse_wait]
         self._evict_reuse_gap_hist = meter.create_histogram(
             "lmcache_mp.l1_chunk_evict_reuse_gap",
             description=(
@@ -90,6 +128,7 @@ class L1LifecycleSubscriber(EventSubscriber):
                 "next reuse.  Capped at max_evict_reuse_wait."
             ),
             unit="s",
+            explicit_bucket_boundaries_advisory=evict_reuse_buckets,
         )
 
         # Shadow map: key -> chunk lifecycle state (live chunks).
