@@ -8,12 +8,15 @@ from threading import Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 import json
+import socket
+import stat
 
 # Third Party
 import pytest
 
 # First Party
 from lmcache.integration.llamacpp.checkpoint_bridge import CheckpointBridge
+from lmcache.integration.llamacpp.checkpoint_service import CheckpointService
 from lmcache.integration.llamacpp.checkpoint_store import CheckpointStore
 from lmcache.v1.distributed.config import (
     EvictionConfig,
@@ -169,3 +172,125 @@ def test_reused_revision_with_different_state_is_rejected(
             bridge.store("1" * 64, 5, {"model": "qwen"})
     finally:
         manager.close()
+
+
+def _service_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(str(socket_path))
+        client.sendall(json.dumps(request).encode() + b"\n")
+        response = client.makefile("rb").readline()
+    return json.loads(response)
+
+
+def _start_service(
+    tmp_path: Path,
+    llama_server: tuple[str, Path, dict[str, Any]],
+    max_request_bytes: int = 4096,
+) -> tuple[CheckpointService, Thread, StorageManager, Path, dict[str, Any]]:
+    llama_url, transfer_dir, state = llama_server
+    manager = _storage_manager(tmp_path / "cache")
+    bridge = CheckpointBridge(
+        CheckpointStore(manager, chunk_size=4096, timeout=5.0),
+        transfer_dir=transfer_dir,
+        llama_url=llama_url,
+        slot_id=0,
+        timeout=5.0,
+    )
+    socket_path = tmp_path / "bridge.sock"
+    service = CheckpointService(bridge, socket_path, max_request_bytes)
+    thread = Thread(target=service.serve_forever, daemon=True)
+    thread.start()
+    return service, thread, manager, socket_path, state
+
+
+def _stop_service(
+    service: CheckpointService,
+    thread: Thread,
+    manager: StorageManager,
+) -> None:
+    service.shutdown()
+    service.server_close()
+    thread.join()
+    manager.close()
+
+
+def test_service_round_trips_checkpoint_over_private_unix_socket(
+    tmp_path: Path,
+    llama_server: tuple[str, Path, dict[str, Any]],
+) -> None:
+    service, thread, manager, socket_path, state = _start_service(
+        tmp_path, llama_server
+    )
+    request = {
+        "action": "store",
+        "cache_salt": "2" * 64,
+        "revision": 6,
+        "compatibility": {"model": "qwen"},
+    }
+
+    try:
+        assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
+        assert _service_request(socket_path, request)["ok"] is True
+        manager.clear()
+        request["action"] = "restore"
+
+        response = _service_request(socket_path, request)
+        stats = _service_request(socket_path, {"action": "stats"})
+
+        assert response["ok"] is True
+        assert state["restored"] == state["payload"]
+        assert stats == {
+            "ok": True,
+            "result": {"errors": 0, "misses": 0, "restores": 1, "stores": 1},
+        }
+    finally:
+        _stop_service(service, thread, manager)
+
+    assert not socket_path.exists()
+
+
+def test_service_rejects_caller_selected_paths(
+    tmp_path: Path,
+    llama_server: tuple[str, Path, dict[str, Any]],
+) -> None:
+    service, thread, manager, socket_path, _state = _start_service(
+        tmp_path, llama_server
+    )
+    request = {
+        "action": "store",
+        "cache_salt": "3" * 64,
+        "revision": 1,
+        "compatibility": {"model": "qwen"},
+        "filename": "outside.bin",
+    }
+
+    try:
+        assert _service_request(socket_path, request) == {
+            "ok": False,
+            "error": "invalid_request",
+        }
+    finally:
+        _stop_service(service, thread, manager)
+
+
+def test_service_rejects_oversized_request(
+    tmp_path: Path,
+    llama_server: tuple[str, Path, dict[str, Any]],
+) -> None:
+    service, thread, manager, socket_path, _state = _start_service(
+        tmp_path, llama_server, max_request_bytes=256
+    )
+    request = {
+        "action": "store",
+        "cache_salt": "4" * 64,
+        "revision": 1,
+        "compatibility": {"padding": "x" * 512},
+    }
+
+    try:
+        assert _service_request(socket_path, request) == {
+            "ok": False,
+            "error": "invalid_request",
+        }
+    finally:
+        _stop_service(service, thread, manager)
