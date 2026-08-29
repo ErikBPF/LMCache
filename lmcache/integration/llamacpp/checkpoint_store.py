@@ -236,6 +236,26 @@ class CheckpointStore:
     ) -> list[ObjectKey]:
         if not objects:
             return []
+        if self._storage_manager.l2_adapters() and not self._fits_in_available_l1(
+            len(objects), object_size
+        ):
+            # ponytail: one-object staging; batch only if profiling proves need.
+            new_keys: list[ObjectKey] = []
+            for key, data in objects.items():
+                written = self._write_object_batch({key: data}, object_size)
+                self._wait_for_l2(written)
+                _deleted, skipped = self._storage_manager.delete_l1_keys(written)
+                if skipped:
+                    raise RuntimeError("persisted checkpoint object remained in L1")
+                new_keys.extend(written)
+            return new_keys
+        return self._write_object_batch(objects, object_size)
+
+    def _write_object_batch(
+        self,
+        objects: Mapping[ObjectKey, bytes],
+        object_size: int,
+    ) -> list[ObjectKey]:
         layout = self._layout(object_size)
         reserved = self._storage_manager.reserve_write(
             list(objects), layout, mode="new"
@@ -255,6 +275,25 @@ class CheckpointStore:
     ) -> list[bytes] | None:
         if not keys:
             return []
+        if self._storage_manager.l2_adapters() and not self._fits_in_available_l1(
+            len(keys), object_size
+        ):
+            # ponytail: one-object staging; batch only if profiling proves need.
+            result: list[bytes] = []
+            for key in keys:
+                item = self._read_object_batch([key], object_size)
+                if item is None:
+                    return None
+                result.extend(item)
+                _deleted, skipped = self._storage_manager.delete_l1_keys([key])
+                if skipped:
+                    raise RuntimeError("restored checkpoint object remained in L1")
+            return result
+        return self._read_object_batch(keys, object_size)
+
+    def _read_object_batch(
+        self, keys: list[ObjectKey], object_size: int
+    ) -> list[bytes] | None:
         handle = self._storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
                 keys=keys,
@@ -274,6 +313,10 @@ class CheckpointStore:
             result = [bytes(memory_obj.byte_array) for memory_obj in memory_objs]
         self._storage_manager.finish_read_prefetched(keys)
         return result
+
+    def _fits_in_available_l1(self, count: int, object_size: int) -> bool:
+        used, total = self._storage_manager.get_l1_usage()
+        return count * object_size <= total - used
 
     def _wait_for_l2(self, keys: list[ObjectKey]) -> None:
         if not keys or not self._storage_manager.l2_adapters():

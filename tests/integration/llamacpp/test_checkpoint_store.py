@@ -23,14 +23,17 @@ from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 
 
-def _storage_manager(cache_dir: Path) -> StorageManager:
+def _storage_manager(
+    cache_dir: Path,
+    l1_size_bytes: int = 4 << 20,
+) -> StorageManager:
     return StorageManager(
         StorageManagerConfig(
             l1_manager_config=L1ManagerConfig(
                 memory_config=L1MemoryManagerConfig(
-                    size_in_bytes=4 << 20,
+                    size_in_bytes=l1_size_bytes,
                     use_lazy=False,
-                    init_size_in_bytes=4 << 20,
+                    init_size_in_bytes=l1_size_bytes,
                     align_bytes=4096,
                     shm_name="",
                 )
@@ -65,6 +68,22 @@ def test_multichunk_checkpoint_restores_from_l2_after_l1_removal(
 
         assert restored == payload
         assert manager.get_l2_usages()[0][0] > len(payload)
+    finally:
+        manager.close()
+
+
+def test_checkpoint_larger_than_l1_streams_through_l2(tmp_path: Path) -> None:
+    chunk_size = 64 << 10
+    manager = _storage_manager(tmp_path, l1_size_bytes=2 * chunk_size)
+    store = CheckpointStore(manager, chunk_size=chunk_size, timeout=5.0)
+    payload = b"a" * chunk_size + b"b" * chunk_size + b"c" * chunk_size
+    compatibility = {"model": "qwen"}
+
+    try:
+        store.store("e" * 64, 1, payload, compatibility)
+        manager.clear()
+
+        assert store.load("e" * 64, 1, compatibility) == payload
     finally:
         manager.close()
 
