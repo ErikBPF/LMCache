@@ -7,7 +7,7 @@ def test_llamacpp_image_is_pinned_and_verifies_its_wheel() -> None:
         Path(__file__).parents[3] / "docker" / "Dockerfile.llamacpp"
     ).read_text()
 
-    assert "python:3.12-slim@sha256:" in dockerfile
+    assert "ARG PYTHON_IMAGE=docker.io/library/python:3.12-slim@sha256:" in dockerfile
     assert "latest" not in dockerfile
     wheel = "/tmp/lmcache-0.5.5.dev54-cp312-cp312-linux_x86_64.whl"
     assert "ARG LMCACHE_REVISION=e3ad4a7a" in dockerfile
