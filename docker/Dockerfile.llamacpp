@@ -1,0 +1,25 @@
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
+FROM ${PYTHON_IMAGE}
+
+ARG LMCACHE_REVISION=99bff2ac
+ARG LMCACHE_WHEEL=dist/lmcache-0.5.5.dev53-cp312-cp312-linux_x86_64.whl
+ARG LMCACHE_WHEEL_SHA256=9440a67878317ba05461e821d56f292534f09427c7578f559b9c728c975db2a0
+
+COPY docker/llamacpp-constraints.txt /tmp/llamacpp-constraints.txt
+COPY ${LMCACHE_WHEEL} /tmp/lmcache-0.5.5.dev53-cp312-cp312-linux_x86_64.whl
+
+RUN echo "${LMCACHE_WHEEL_SHA256}  /tmp/lmcache-0.5.5.dev53-cp312-cp312-linux_x86_64.whl" | sha256sum --check --strict \
+    && python -m pip install --no-cache-dir \
+        --constraint /tmp/llamacpp-constraints.txt \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch \
+    && python -m pip install --no-cache-dir \
+        --constraint /tmp/llamacpp-constraints.txt \
+        /tmp/lmcache-0.5.5.dev53-cp312-cp312-linux_x86_64.whl \
+    && rm /tmp/lmcache-0.5.5.dev53-cp312-cp312-linux_x86_64.whl \
+        /tmp/llamacpp-constraints.txt
+
+LABEL org.opencontainers.image.revision=${LMCACHE_REVISION} \
+      io.orion.lmcache.wheel-sha256=${LMCACHE_WHEEL_SHA256}
+
+ENTRYPOINT ["python", "-m", "lmcache.integration.llamacpp.checkpoint_daemon"]
