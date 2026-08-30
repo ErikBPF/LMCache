@@ -229,6 +229,61 @@ class CheckpointStore:
             raise CheckpointCorruptError("checkpoint checksum mismatch")
         return payload
 
+    def delete_revision(
+        self,
+        cache_salt: str,
+        revision: int,
+        retained_revision: int,
+    ) -> None:
+        """Delete one obsolete revision without deleting shared checkpoint chunks.
+
+        Args:
+            cache_salt: Lowercase 64-character digest isolating one session.
+            revision: Obsolete session revision to delete.
+            retained_revision: Revision whose chunks must remain available.
+
+        Raises:
+            ValueError: If identities are invalid or the retained revision is absent.
+            CheckpointCorruptError: If either manifest has invalid chunk metadata.
+            RuntimeError: If an L1 object is locked and cannot be deleted.
+        """
+        self._validate_identity(cache_salt, revision)
+        self._validate_identity(cache_salt, retained_revision)
+        if revision == retained_revision:
+            raise ValueError("revision and retained_revision must differ")
+
+        manifest_key = self._manifest_key(cache_salt, revision)
+        manifest_blob = self._read_objects([manifest_key], self._manifest_size)
+        if manifest_blob is None:
+            return
+        retained_blob = self._read_objects(
+            [self._manifest_key(cache_salt, retained_revision)],
+            self._manifest_size,
+        )
+        if retained_blob is None:
+            raise ValueError("retained checkpoint revision does not exist")
+
+        manifest = self._decode_manifest(manifest_blob[0])
+        retained_manifest = self._decode_manifest(retained_blob[0])
+        if manifest.get("revision") != revision or retained_manifest.get(
+            "revision"
+        ) != retained_revision:
+            raise CheckpointCorruptError("checkpoint manifest revision mismatch")
+        retained_chunks = set(
+            self._manifest_chunk_keys(cache_salt, retained_manifest)
+        )
+        obsolete_chunks = [
+            key
+            for key in dict.fromkeys(
+                self._manifest_chunk_keys(cache_salt, manifest)
+            )
+            if key not in retained_chunks
+        ]
+
+        # Chunks first keeps the manifest available to resume an interrupted delete.
+        self._delete_objects(obsolete_chunks)
+        self._delete_objects([manifest_key])
+
     def _write_objects(
         self,
         objects: Mapping[ObjectKey, bytes],
@@ -314,6 +369,16 @@ class CheckpointStore:
         self._storage_manager.finish_read_prefetched(keys)
         return result
 
+    def _delete_objects(self, keys: list[ObjectKey]) -> None:
+        if not keys:
+            return
+        adapters = self._storage_manager.l2_adapters()
+        if adapters:
+            adapters[0][1].delete(keys)
+        _deleted, skipped = self._storage_manager.delete_l1_keys(keys)
+        if skipped:
+            raise RuntimeError("checkpoint object remained locked in L1")
+
     def _fits_in_available_l1(self, count: int, object_size: int) -> bool:
         used, total = self._storage_manager.get_l1_usage()
         return count * object_size <= total - used
@@ -344,6 +409,19 @@ class CheckpointStore:
         if len(encoded) + 4 > self._manifest_size:
             raise ValueError("checkpoint manifest exceeds manifest_size")
         return struct.pack(">I", len(encoded)) + encoded
+
+    def _manifest_chunk_keys(
+        self,
+        cache_salt: str,
+        manifest: Mapping[str, Any],
+    ) -> list[ObjectKey]:
+        try:
+            return [
+                self._chunk_key(cache_salt, bytes.fromhex(record["sha256"]))
+                for record in manifest["chunks"]
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CheckpointCorruptError("invalid checkpoint manifest") from exc
 
     @staticmethod
     def _decode_manifest(blob: bytes) -> dict[str, Any]:

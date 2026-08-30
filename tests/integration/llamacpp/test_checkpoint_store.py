@@ -133,3 +133,57 @@ def test_repeated_chunks_preserve_checkpoint_positions(tmp_path: Path) -> None:
         assert store.load("d" * 64, 2, {"model": "qwen"}) == payload
     finally:
         manager.close()
+
+
+def test_delete_revision_keeps_chunks_shared_with_retained_head(
+    tmp_path: Path,
+) -> None:
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
+    cache_salt = "f" * 64
+    compatibility = {"model": "qwen"}
+    shared = b"s" * 4096
+    retained = shared + b"n" * 4096
+
+    try:
+        store.store(cache_salt, 1, shared + b"o" * 4096, compatibility)
+        store.store(cache_salt, 2, retained, compatibility)
+
+        store.delete_revision(cache_salt, 1, retained_revision=2)
+        store.delete_revision(cache_salt, 1, retained_revision=2)
+        manager.clear()
+
+        assert store.load(cache_salt, 1, compatibility) is None
+        assert store.load(cache_salt, 2, compatibility) == retained
+        assert len(list(tmp_path.glob("llamacpp-checkpoint-chunk-v1@*.data"))) == 2
+        assert len(list(tmp_path.glob("llamacpp-checkpoint-manifest-v1@*.data"))) == 1
+    finally:
+        manager.close()
+
+
+def test_delete_revision_resumes_after_missing_old_chunk(tmp_path: Path) -> None:
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
+    cache_salt = "0" * 64
+    compatibility = {"model": "qwen"}
+    shared = b"s" * 4096
+    retained = shared + b"n" * 4096
+
+    try:
+        store.store(cache_salt, 1, shared + b"o" * 4096, compatibility)
+        store.store(cache_salt, 2, retained, compatibility)
+        manager.clear()
+        old_chunk = next(
+            path
+            for path in tmp_path.glob("llamacpp-checkpoint-chunk-v1@*.data")
+            if path.read_bytes().startswith(b"o" * 4096)
+        )
+        old_chunk.unlink()
+
+        store.delete_revision(cache_salt, 1, retained_revision=2)
+        manager.clear()
+
+        assert store.load(cache_salt, 1, compatibility) is None
+        assert store.load(cache_salt, 2, compatibility) == retained
+    finally:
+        manager.close()
