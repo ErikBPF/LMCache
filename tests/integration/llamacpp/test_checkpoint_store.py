@@ -15,11 +15,11 @@ import struct
 import pytest
 
 # First Party
+from lmcache.integration.llamacpp import checkpoint_store
 from lmcache.integration.llamacpp.checkpoint_store import (
     CheckpointCorruptError,
     CheckpointStore,
 )
-from lmcache.integration.llamacpp import checkpoint_store
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     L1ManagerConfig,

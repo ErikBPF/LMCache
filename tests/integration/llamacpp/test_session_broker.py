@@ -7,8 +7,8 @@ from pathlib import Path
 from threading import Event, Thread
 from urllib.parse import parse_qs, urlsplit
 import json
-import stat
 import sqlite3
+import stat
 
 # Third Party
 import pytest
