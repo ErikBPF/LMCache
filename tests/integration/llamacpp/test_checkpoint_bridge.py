@@ -3,19 +3,29 @@
 
 # Standard
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from threading import Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+import array
 import json
+import mmap
+import os
 import socket
 import stat
+import struct
+import tempfile
 
 # Third Party
 import pytest
 
 # First Party
 from lmcache.integration.llamacpp.checkpoint_bridge import CheckpointBridge
+from lmcache.integration.llamacpp.checkpoint_client import (
+    restore_checkpoint,
+    store_checkpoint,
+)
 from lmcache.integration.llamacpp.checkpoint_service import CheckpointService
 from lmcache.integration.llamacpp.checkpoint_store import CheckpointStore
 from lmcache.v1.distributed.config import (
@@ -29,7 +39,7 @@ from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import FSL2AdapterConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
 
 
-def _storage_manager(cache_dir: Path) -> StorageManager:
+def _storage_manager(cache_dir: Path, shm_name: str = "") -> StorageManager:
     return StorageManager(
         StorageManagerConfig(
             l1_manager_config=L1ManagerConfig(
@@ -38,7 +48,7 @@ def _storage_manager(cache_dir: Path) -> StorageManager:
                     use_lazy=False,
                     init_size_in_bytes=4 << 20,
                     align_bytes=4096,
-                    shm_name="",
+                    shm_name=shm_name,
                 )
             ),
             eviction_config=EvictionConfig(eviction_policy="LRU"),
@@ -174,33 +184,36 @@ def test_reused_revision_with_different_state_is_rejected(
         manager.close()
 
 
-def _service_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+def _service_request(
+    socket_path: Path,
+    request: dict[str, Any],
+    body: bytes = b"",
+) -> dict[str, Any]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.connect(str(socket_path))
-        client.sendall(json.dumps(request).encode() + b"\n")
+        client.sendall(json.dumps(request).encode() + b"\n" + body)
         response = client.makefile("rb").readline()
     return json.loads(response)
 
 
 def _start_service(
     tmp_path: Path,
-    llama_server: tuple[str, Path, dict[str, Any]],
     max_request_bytes: int = 4096,
-) -> tuple[CheckpointService, Thread, StorageManager, Path, dict[str, Any]]:
-    llama_url, transfer_dir, state = llama_server
-    manager = _storage_manager(tmp_path / "cache")
-    bridge = CheckpointBridge(
-        CheckpointStore(manager, chunk_size=4096, timeout=5.0),
-        transfer_dir=transfer_dir,
-        llama_url=llama_url,
-        slot_id=0,
-        timeout=5.0,
-    )
+    max_checkpoint_bytes: int = 64 << 30,
+    shm_name: str = "",
+) -> tuple[CheckpointService, Thread, StorageManager, Path]:
+    manager = _storage_manager(tmp_path / "cache", shm_name)
     socket_path = tmp_path / "bridge.sock"
-    service = CheckpointService(bridge, socket_path, max_request_bytes)
+    service = CheckpointService(
+        CheckpointStore(manager, chunk_size=4096, timeout=5.0),
+        socket_path,
+        max_request_bytes,
+        max_checkpoint_bytes,
+        shm_name,
+    )
     thread = Thread(target=service.serve_forever, daemon=True)
     thread.start()
-    return service, thread, manager, socket_path, state
+    return service, thread, manager, socket_path
 
 
 def _stop_service(
@@ -216,29 +229,33 @@ def _stop_service(
 
 def test_service_round_trips_checkpoint_over_private_unix_socket(
     tmp_path: Path,
-    llama_server: tuple[str, Path, dict[str, Any]],
 ) -> None:
-    service, thread, manager, socket_path, state = _start_service(
-        tmp_path, llama_server
-    )
-    request = {
-        "action": "store",
-        "cache_salt": "2" * 64,
-        "revision": 6,
-        "compatibility": {"model": "qwen"},
-    }
+    service, thread, manager, socket_path = _start_service(tmp_path)
+    checkpoint = b"opaque-llama-state\0" * 1000
+    cache_salt = "2" * 64
+    revision = 6
+    compatibility = {"model": "qwen"}
 
     try:
         assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
-        assert _service_request(socket_path, request)["ok"] is True
+        store_checkpoint(
+            socket_path,
+            checkpoint,
+            cache_salt,
+            revision,
+            compatibility,
+        )
         manager.clear()
-        request["action"] = "restore"
 
-        response = _service_request(socket_path, request)
+        restored = restore_checkpoint(
+            socket_path,
+            cache_salt,
+            revision,
+            compatibility,
+        )
         stats = _service_request(socket_path, {"action": "stats"})
 
-        assert response["ok"] is True
-        assert state["restored"] == state["payload"]
+        assert restored == checkpoint
         assert stats == {
             "ok": True,
             "result": {"errors": 0, "misses": 0, "restores": 1, "stores": 1},
@@ -249,13 +266,265 @@ def test_service_round_trips_checkpoint_over_private_unix_socket(
     assert not socket_path.exists()
 
 
+def test_service_stores_checkpoint_from_passed_file_descriptor(
+    tmp_path: Path,
+) -> None:
+    service, thread, manager, socket_path = _start_service(tmp_path)
+    checkpoint = b"fd-backed-llama-state\0" * 1000
+    identity = {
+        "cache_salt": "8" * 64,
+        "revision": 1,
+        "compatibility": {"model": "qwen"},
+    }
+
+    try:
+        with tempfile.TemporaryFile() as checkpoint_file:
+            checkpoint_file.write(checkpoint)
+            checkpoint_file.flush()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.connect(str(socket_path))
+                request = {
+                    "action": "store",
+                    "length": len(checkpoint),
+                    "transport": "fd",
+                    **identity,
+                }
+                client.sendall(json.dumps(request).encode() + b"\n")
+                with client.makefile("rb") as response_stream:
+                    assert json.loads(response_stream.readline()) == {
+                        "ok": True,
+                        "ready": True,
+                    }
+                    client.sendmsg(
+                        [b"\0"],
+                        [
+                            (
+                                socket.SOL_SOCKET,
+                                socket.SCM_RIGHTS,
+                                struct.pack("i", checkpoint_file.fileno()),
+                            )
+                        ],
+                    )
+                    assert json.loads(response_stream.readline())["ok"] is True
+
+        manager.clear()
+        assert restore_checkpoint(socket_path, **identity) == checkpoint
+    finally:
+        _stop_service(service, thread, manager)
+
+
+def test_service_restores_checkpoint_from_l1_shared_memory_fd(
+    tmp_path: Path,
+) -> None:
+    shm_name = f"lmcache_l1_pool_llamacpp_test_{os.getpid()}"
+    service, thread, manager, socket_path = _start_service(
+        tmp_path,
+        shm_name=shm_name,
+    )
+    checkpoint = b"a" * 4096 + b"b" * 4096 + b"tail"
+    identity = {
+        "cache_salt": "9" * 64,
+        "revision": 1,
+        "compatibility": {"model": "qwen"},
+    }
+
+    try:
+        store_checkpoint(socket_path, checkpoint, **identity)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            client.sendall(
+                json.dumps(
+                    {"action": "restore", "transport": "fd", **identity}
+                ).encode()
+                + b"\n"
+            )
+            with client.makefile("rb") as response_stream:
+                response = json.loads(response_stream.readline())
+                assert response["transport"] == "fd"
+                assert response["length"] == len(checkpoint)
+                descriptors = array.array("i")
+                marker, ancillary, flags, _address = client.recvmsg(
+                    1,
+                    socket.CMSG_SPACE(descriptors.itemsize),
+                )
+                for level, kind, data in ancillary:
+                    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                        descriptors.frombytes(data[: descriptors.itemsize])
+                assert marker == b"\0"
+                assert not flags & socket.MSG_CTRUNC
+                assert len(descriptors) == 1
+                fd = descriptors.pop()
+                try:
+                    with mmap.mmap(fd, 0, access=mmap.ACCESS_READ) as pool:
+                        restored = b"".join(
+                            pool[offset : offset + length]
+                            for offset, length in response["regions"]
+                        )
+                finally:
+                    os.close(fd)
+                client.sendall(b"\0")
+
+        assert restored == checkpoint
+    finally:
+        _stop_service(service, thread, manager)
+
+
+def test_service_reports_store_stage_timings(tmp_path: Path) -> None:
+    service, thread, manager, socket_path = _start_service(tmp_path)
+    request = {
+        "action": "store",
+        "cache_salt": "5" * 64,
+        "revision": 1,
+        "compatibility": {"model": "qwen"},
+        "length": 4096,
+    }
+
+    try:
+        response = _service_request(socket_path, request, b"x" * 4096)
+
+        assert response["ok"] is True
+        assert set(response["timings_ms"]) == {
+            "chunk_write",
+            "hash",
+            "hash_wait",
+            "manifest",
+            "receive",
+            "wait",
+        }
+        assert all(value >= 0 for value in response["timings_ms"].values())
+    finally:
+        _stop_service(service, thread, manager)
+
+
+def test_service_streams_incoming_checkpoint_to_store() -> None:
+    class RecordingStore:
+        def __init__(self) -> None:
+            self.aggregate_called = False
+            self.streamed = b""
+
+        def store(self, *args: Any, **kwargs: Any) -> None:
+            self.aggregate_called = True
+
+        def store_from_reader(
+            self,
+            cache_salt: str,
+            revision: int,
+            checkpoint_length: int,
+            reader: Any,
+            compatibility: dict[str, Any],
+            timings: dict[str, float],
+        ) -> None:
+            self.streamed = reader(checkpoint_length)
+            timings.update(
+                {
+                    "chunk_write": 0.0,
+                    "hash": 0.0,
+                    "hash_wait": 0.0,
+                    "receive": 0.0,
+                    "wait": 0.0,
+                    "manifest": 0.0,
+                }
+            )
+
+    store = RecordingStore()
+    service = object.__new__(CheckpointService)
+    service.checkpoint_store = store
+    service.max_checkpoint_bytes = 64 << 30
+    service.stats = {"errors": 0, "misses": 0, "restores": 0, "stores": 0}
+    request = json.dumps(
+        {
+            "action": "store",
+            "cache_salt": "6" * 64,
+            "revision": 1,
+            "compatibility": {"model": "qwen"},
+            "length": 8,
+        }
+    ).encode()
+    output = BytesIO()
+
+    service.serve_request(request, BytesIO(b"abcdefgh"), output)
+
+    assert store.aggregate_called is False
+    assert store.streamed == b"abcdefgh"
+    assert json.loads(output.getvalue())["ok"] is True
+
+
+def test_service_writes_checkpoint_without_combining_frame() -> None:
+    class RecordingStream:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    stream = RecordingStream()
+    checkpoint = b"opaque-state"
+    service = object.__new__(CheckpointService)
+
+    service.write_response(
+        stream,
+        {"found": True, "length": len(checkpoint), "ok": True},
+        checkpoint,
+    )
+
+    assert stream.writes == [
+        b'{"found":true,"length":12,"ok":true}\n',
+        checkpoint,
+    ]
+
+
+def test_service_streams_checkpoint_views(tmp_path: Path) -> None:
+    class RecordingStream:
+        def __init__(self) -> None:
+            self.writes: list[bytes | memoryview] = []
+
+        def write(self, data: bytes | memoryview) -> int:
+            self.writes.append(data)
+            return len(data)
+
+    service, thread, manager, _socket_path = _start_service(tmp_path)
+    payload = b"a" * 4096 + b"b" * 4096 + b"tail"
+    cache_salt = "7" * 64
+    compatibility = {"model": "qwen"}
+    request = json.dumps(
+        {
+            "action": "restore",
+            "cache_salt": cache_salt,
+            "revision": 1,
+            "compatibility": compatibility,
+            "transport": "fd",
+        }
+    ).encode()
+    stream = RecordingStream()
+
+    try:
+        service.checkpoint_store.store(cache_salt, 1, payload, compatibility)
+
+        service.serve_request(request, BytesIO(), stream)
+
+        header = json.loads(stream.writes[0])
+        assert header["found"] is True
+        assert header["length"] == len(payload)
+        assert header["ok"] is True
+        assert "transport" not in header
+        assert set(header["timings_ms"]) == {
+            "chunk_read",
+            "manifest_read",
+            "validate",
+            "validate_skipped",
+        }
+        assert all(value >= 0 for value in header["timings_ms"].values())
+        assert all(isinstance(chunk, memoryview) for chunk in stream.writes[1:])
+        assert b"".join(stream.writes[1:]) == payload
+    finally:
+        _stop_service(service, thread, manager)
+
+
 def test_service_rejects_caller_selected_paths(
     tmp_path: Path,
-    llama_server: tuple[str, Path, dict[str, Any]],
 ) -> None:
-    service, thread, manager, socket_path, _state = _start_service(
-        tmp_path, llama_server
-    )
+    service, thread, manager, socket_path = _start_service(tmp_path)
     request = {
         "action": "store",
         "cache_salt": "3" * 64,
@@ -275,10 +544,9 @@ def test_service_rejects_caller_selected_paths(
 
 def test_service_rejects_oversized_request(
     tmp_path: Path,
-    llama_server: tuple[str, Path, dict[str, Any]],
 ) -> None:
-    service, thread, manager, socket_path, _state = _start_service(
-        tmp_path, llama_server, max_request_bytes=256
+    service, thread, manager, socket_path = _start_service(
+        tmp_path, max_request_bytes=256
     )
     request = {
         "action": "store",
@@ -289,6 +557,28 @@ def test_service_rejects_oversized_request(
 
     try:
         assert _service_request(socket_path, request) == {
+            "ok": False,
+            "error": "invalid_request",
+        }
+    finally:
+        _stop_service(service, thread, manager)
+
+
+def test_service_rejects_oversized_checkpoint(tmp_path: Path) -> None:
+    service, thread, manager, socket_path = _start_service(
+        tmp_path,
+        max_checkpoint_bytes=8,
+    )
+    request = {
+        "action": "store",
+        "cache_salt": "6" * 64,
+        "revision": 1,
+        "compatibility": {"model": "qwen"},
+        "length": 9,
+    }
+
+    try:
+        assert _service_request(socket_path, request, b"123456789") == {
             "ok": False,
             "error": "invalid_request",
         }

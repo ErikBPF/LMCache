@@ -2,7 +2,14 @@
 """Opaque llama.cpp checkpoint storage integration tests."""
 
 # Standard
+from contextlib import contextmanager
+from hashlib import sha256 as real_sha256
 from pathlib import Path
+from threading import Event, Lock
+from time import sleep
+import ctypes
+import json
+import struct
 
 # Third Party
 import pytest
@@ -12,6 +19,7 @@ from lmcache.integration.llamacpp.checkpoint_store import (
     CheckpointCorruptError,
     CheckpointStore,
 )
+from lmcache.integration.llamacpp import checkpoint_store
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     L1ManagerConfig,
@@ -72,6 +80,27 @@ def test_multichunk_checkpoint_restores_from_l2_after_l1_removal(
         manager.close()
 
 
+def test_read_checkpoint_exposes_validated_chunk_views(tmp_path: Path) -> None:
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
+    payload = b"a" * 4096 + b"b" * 4096 + b"tail"
+    compatibility = {"model": "qwen"}
+
+    try:
+        store.store("7" * 64, 1, payload, compatibility)
+        manager.clear()
+
+        with store.read_checkpoint("7" * 64, 1, compatibility) as restored:
+            assert restored is not None
+            length, chunks = restored
+            assert length == len(payload)
+            assert len(chunks) == 3
+            assert all(isinstance(chunk, memoryview) for chunk in chunks)
+            assert b"".join(chunks) == payload
+    finally:
+        manager.close()
+
+
 def test_checkpoint_larger_than_l1_streams_through_l2(tmp_path: Path) -> None:
     chunk_size = 64 << 10
     manager = _storage_manager(tmp_path, l1_size_bytes=2 * chunk_size)
@@ -88,7 +117,63 @@ def test_checkpoint_larger_than_l1_streams_through_l2(tmp_path: Path) -> None:
         manager.close()
 
 
-def test_same_length_chunk_corruption_is_rejected(tmp_path: Path) -> None:
+def test_restore_retries_when_l1_key_disappears_after_prefetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
+    payload = b"checkpoint" * 1000
+    compatibility = {"model": "qwen"}
+    original_read = manager.read_prefetched_results
+    evict = True
+
+    @contextmanager
+    def evict_before_first_read(keys):
+        nonlocal evict
+        if evict:
+            evict = False
+            manager._l1_manager.delete(keys, force=True)
+        with original_read(keys) as objects:
+            yield objects
+
+    try:
+        store.store("1" * 64, 1, payload, compatibility)
+        monkeypatch.setattr(manager, "read_prefetched_results", evict_before_first_read)
+
+        assert store.load("1" * 64, 1, compatibility) == payload
+    finally:
+        manager.close()
+
+
+def test_stream_restore_clears_l1_headroom_for_one_l2_chunk(tmp_path: Path) -> None:
+    chunk_size = 64 << 10
+    manager = _storage_manager(tmp_path, l1_size_bytes=4 * chunk_size)
+    store = CheckpointStore(
+        manager,
+        chunk_size=chunk_size,
+        manifest_size=4096,
+        timeout=5.0,
+    )
+    compatibility = {"model": "qwen"}
+    payloads = {
+        salt: b"".join(bytes([value + offset]) * chunk_size for offset in range(3))
+        for salt, value in zip(("1", "2", "3", "4"), range(1, 5), strict=True)
+    }
+
+    try:
+        for salt, payload in payloads.items():
+            store.store(salt * 64, 1, payload, compatibility)
+
+        assert store.load("2" * 64, 1, compatibility) == payloads["2"]
+    finally:
+        manager.close()
+
+
+def test_same_length_chunk_corruption_is_rejected(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     manager = _storage_manager(tmp_path)
     store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
     compatibility = {"model": "Qwen3.8-27B-UD-IQ3_XXS-v3"}
@@ -103,6 +188,7 @@ def test_same_length_chunk_corruption_is_rejected(tmp_path: Path) -> None:
 
         with pytest.raises(CheckpointCorruptError, match="checksum"):
             store.load("b" * 64, 3, compatibility)
+        assert "finish read on non-existing key" not in caplog.text
     finally:
         manager.close()
 
@@ -131,6 +217,269 @@ def test_repeated_chunks_preserve_checkpoint_positions(tmp_path: Path) -> None:
         manager.clear()
 
         assert store.load("d" * 64, 2, {"model": "qwen"}) == payload
+    finally:
+        manager.close()
+
+
+def test_store_does_not_slice_checkpoint_bytes(tmp_path: Path) -> None:
+    class UnsliceableBytes(bytes):
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                raise AssertionError("checkpoint bytes were copied by slicing")
+            return super().__getitem__(key)
+
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
+    payload = UnsliceableBytes(b"x" * 8192)
+
+    try:
+        store.store("9" * 64, 1, payload, {"model": "qwen"})
+        manager.clear()
+
+        assert store.load("9" * 64, 1, {"model": "qwen"}) == payload
+    finally:
+        manager.close()
+
+
+def test_store_hashes_large_checkpoint_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = 0
+    peak = 0
+    lock = Lock()
+
+    def tracked_sha256(data=b""):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            sleep(0.01)
+            return real_sha256(data)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(checkpoint_store, "sha256", tracked_sha256)
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=512 << 10, timeout=5.0)
+
+    try:
+        store.store("8" * 64, 1, b"x" * (2 << 20), {"model": "qwen"})
+
+        assert peak > 1
+    finally:
+        manager.close()
+
+
+def test_store_from_reader_hashes_while_receiving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
+    first_hash_started = Event()
+    payload = b"a" * 4096 + b"b" * 4096
+    offset = 0
+
+    def tracked_sha256(data=b""):
+        if data == payload[:4096]:
+            first_hash_started.set()
+        return real_sha256(data)
+
+    def read(size: int) -> bytes:
+        nonlocal offset
+        if offset == 4096:
+            assert first_hash_started.wait(1)
+        chunk = payload[offset : offset + size]
+        offset += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(checkpoint_store, "sha256", tracked_sha256)
+    try:
+        store.store_from_reader(
+            "8" * 64,
+            2,
+            len(payload),
+            read,
+            {"model": "qwen"},
+        )
+
+        assert store.load("8" * 64, 2, {"model": "qwen"}) == payload
+    finally:
+        manager.close()
+
+
+def test_store_from_reader_copies_writable_chunks_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _storage_manager(tmp_path, l1_size_bytes=4 << 20)
+    store = CheckpointStore(manager, chunk_size=512 << 10, timeout=5.0)
+    payload = bytearray(b"".join(bytes([value]) * (512 << 10) for value in range(4)))
+    view = memoryview(payload)
+    offset = 0
+    active = 0
+    peak = 0
+    lock = Lock()
+    real_memmove = ctypes.memmove
+
+    def tracked_memmove(destination, source, count):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            sleep(0.01)
+            return real_memmove(destination, source, count)
+        finally:
+            with lock:
+                active -= 1
+
+    def read(size: int) -> memoryview:
+        nonlocal offset
+        chunk = view[offset : offset + size]
+        offset += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(ctypes, "memmove", tracked_memmove)
+    try:
+        store.store_from_reader(
+            "b" * 64,
+            1,
+            len(payload),
+            read,
+            {"model": "qwen"},
+        )
+
+        assert peak > 1
+        assert store.load("b" * 64, 1, {"model": "qwen"}) == payload
+    finally:
+        view.release()
+        manager.close()
+
+
+def test_load_hashes_each_checkpoint_chunk_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
+    payload = b"a" * 4096 + b"b" * 4096
+    compatibility = {"model": "qwen"}
+
+    try:
+        store.store("6" * 64, 1, payload, compatibility)
+        calls = 0
+
+        def tracked_sha256(data=b""):
+            nonlocal calls
+            calls += 1
+            return real_sha256(data)
+
+        monkeypatch.setattr(checkpoint_store, "sha256", tracked_sha256)
+
+        assert store.load("6" * 64, 1, compatibility) == payload
+        assert calls == 4  # Manifest key, two chunks, and chunk-digest checksum.
+    finally:
+        manager.close()
+
+
+def test_validate_once_skips_rehash_after_verified_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(
+        manager,
+        chunk_size=4096,
+        timeout=5.0,
+        validate_once=True,
+    )
+    payload = b"a" * 4096 + b"b" * 4096
+    compatibility = {"model": "qwen"}
+
+    try:
+        store.store("9" * 64, 1, payload, compatibility)
+        calls = 0
+
+        def tracked_sha256(data=b""):
+            nonlocal calls
+            calls += 1
+            return real_sha256(data)
+
+        monkeypatch.setattr(checkpoint_store, "sha256", tracked_sha256)
+
+        assert store.load("9" * 64, 1, compatibility) == payload
+        assert calls == 1  # Manifest lookup only; stored checkpoint is trusted.
+    finally:
+        manager.close()
+
+
+def test_load_hashes_large_checkpoint_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = 0
+    peak = 0
+    lock = Lock()
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=512 << 10, timeout=5.0)
+    payload = b"x" * (2 << 20)
+    compatibility = {"model": "qwen"}
+
+    try:
+        store.store("6" * 64, 1, payload, compatibility)
+
+        def tracked_sha256(data=b""):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                sleep(0.01)
+                return real_sha256(data)
+            finally:
+                with lock:
+                    active -= 1
+
+        monkeypatch.setattr(checkpoint_store, "sha256", tracked_sha256)
+
+        assert store.load("6" * 64, 1, compatibility) == payload
+        assert peak > 1
+    finally:
+        manager.close()
+
+
+def test_load_accepts_legacy_whole_checkpoint_checksum(tmp_path: Path) -> None:
+    manager = _storage_manager(tmp_path)
+    store = CheckpointStore(manager, chunk_size=4096, timeout=5.0)
+    payload = b"legacy-checkpoint" * 1000
+    compatibility = {"model": "qwen"}
+
+    try:
+        store.store("5" * 64, 1, payload, compatibility)
+        manager.clear()
+        path = next(tmp_path.glob("llamacpp-checkpoint-manifest-v1@*.data"))
+        blob = bytearray(path.read_bytes())
+        length = struct.unpack(">I", blob[:4])[0]
+        manifest = json.loads(blob[4 : 4 + length])
+        manifest.pop("checkpoint_hash_scheme")
+        manifest["checkpoint_sha256"] = real_sha256(payload).hexdigest()
+        encoded = json.dumps(
+            manifest,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        blob[:] = (
+            struct.pack(">I", len(encoded))
+            + encoded
+            + bytes(len(blob) - len(encoded) - 4)
+        )
+        path.write_bytes(blob)
+
+        assert store.load("5" * 64, 1, compatibility) == payload
     finally:
         manager.close()
 
