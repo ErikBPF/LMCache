@@ -168,6 +168,11 @@ def shm_map_readwrite(name: str, nbytes: int) -> int:
     return addr
 
 
+def shm_open_readonly_fd(name: str) -> int:
+    """Open an existing shared-memory segment and return an owned read-only fd."""
+    return _posixshmem.shm_open(_slashed(name), os.O_RDONLY, mode=0o600)
+
+
 def shm_munmap(addr: int, nbytes: int = 0) -> None:
     """Best-effort release of a previously mapped segment by address.
 

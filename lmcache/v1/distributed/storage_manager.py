@@ -177,6 +177,10 @@ class StorageManager:
             self.get_l2_usages,
         )
 
+    def get_l1_memory_desc(self) -> L1MemoryDesc | None:
+        """Return the address and size of the contiguous L1 arena, if any."""
+        return self._l1_memory_desc
+
     # External APIs for serving engine integration code to call
     @enable_tracing()
     def reserve_write(
